@@ -10,3 +10,25 @@ cmake-build-*/
 *.exe
 compile_commands.json
 .DS_Store
+
+# Runtime state
+imgui.ini
+
+# HDR environment assets (downloaded per docs/assets_attribution.md)
+assets/env/*.hdr
+assets/env/*.HDR
+
+# LaTeX build artefacts
+report/*.aux
+report/*.lbl
+report/*.log
+report/*.bbl
+report/*.blg
+report/*.brf
+report/*.fdb_latexmk
+report/*.fls
+report/*.out
+report/*.synctex.gz
+report/*.toc
+report/*.lof
+report/*.lot

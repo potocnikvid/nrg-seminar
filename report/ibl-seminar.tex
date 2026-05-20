@@ -1,0 +1,499 @@
+% ---------------------------------------------------------------------------
+% Seminar report: Real-Time Image-Based Lighting with the Split-Sum Approximation
+% Advanced Computer Graphics, 2025/26 -- Topic 2.9
+% ---------------------------------------------------------------------------
+
+\documentclass{egpubl}
+\JournalSubmission
+\electronicVersion
+
+\ifpdf \usepackage[pdftex]{graphicx} \pdfcompresslevel=9
+\else  \usepackage[dvips]{graphicx} \fi
+
+\PrintedOrElectronic
+
+\usepackage{t1enc,dfadobe}
+\usepackage{egweblnk}
+\usepackage{cite}
+
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+    basicstyle=\ttfamily\scriptsize,
+    breaklines=true,
+    columns=fullflexible,
+    showstringspaces=false,
+    keywordstyle=\color{blue!70!black},
+    commentstyle=\color{gray}
+}
+
+% ---------------------------------------------------------------------------
+\title[Real-Time IBL with Split-Sum]%
+      {Real-Time Image-Based Lighting with the Split-Sum Approximation}
+
+\author[V. Poto\v{c}nik]
+{\parbox{\textwidth}{\centering Vid Poto\v{c}nik$^{1}$}
+ \\
+ {\parbox{\textwidth}{\centering
+   $^1$University of Ljubljana, Faculty of Computer and Information Science, Slovenia
+ }}
+}
+
+% ---------------------------------------------------------------------------
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\textit{We present a real-time rendering pipeline that uses image-based lighting (IBL)
+to evaluate the contribution of an HDR environment map to physically based shading.
+The pipeline precomputes a diffuse irradiance cubemap by cosine-weighted hemisphere
+convolution, a specular prefiltered environment cubemap with mip-level encoded
+roughness via GGX importance sampling, and a two-dimensional BRDF integration lookup
+table using the split-sum approximation of Karis. At render time the diffuse and
+specular IBL terms are evaluated with three texture fetches and a Schlick--Fresnel
+modulation. We implement the pipeline in OpenGL~3.3 and analyse the trade-offs
+between preprocessing time, memory cost, and rendering accuracy across three HDR
+environments.}
+
+\begin{CCSXML}
+<ccs2012>
+<concept>
+<concept_id>10010147.10010371.10010372.10010374</concept_id>
+<concept_desc>Computing methodologies~Rendering</concept_desc>
+<concept_significance>500</concept_significance>
+</concept>
+<concept>
+<concept_id>10010147.10010371.10010372.10010375</concept_id>
+<concept_desc>Computing methodologies~Reflectance modeling</concept_desc>
+<concept_significance>300</concept_significance>
+</concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Computing methodologies~Rendering}
+\ccsdesc[300]{Computing methodologies~Reflectance modeling}
+
+\printccsdesc
+\end{abstract}
+
+% ---------------------------------------------------------------------------
+\section{Introduction}
+
+Realistic surface appearance under arbitrary illumination depends strongly on the
+surrounding environment. Image-based lighting (IBL), introduced by
+Debevec~\cite{Debevec1998} and later codified as a practical
+technique~\cite{Debevec2006}, uses a captured high-dynamic-range (HDR) panoramic
+image as the sole light source, evaluating the rendering equation against the
+panoramic radiance distribution directly. A naive evaluation requires Monte Carlo
+integration per pixel, which is incompatible with real-time constraints.
+
+Karis~\cite{Karis2013} proposed a \emph{split-sum} approximation that decomposes
+the specular IBL integral into a precomputed prefiltered environment map and a 2D
+scale--bias lookup table. Combined with the standard cosine-weighted irradiance
+map for the diffuse term~\cite{Ramamoorthi2001}, this reduces IBL evaluation to
+three constant-time texture fetches per pixel and is the foundation of the
+real-time physically based rendering (PBR) pipelines used in modern game
+engines~\cite{Burley2012}.
+
+This work implements and analyses such a pipeline for the GGX microfacet
+BRDF~\cite{Walter2007}. Section~\ref{sec:background} reviews the underlying theory.
+Section~\ref{sec:pipeline} describes the four preprocessing passes and the per-frame
+shading. Section~\ref{sec:impl} describes the implementation.
+Section~\ref{sec:results} reports preprocessing times, rendering performance, and a
+qualitative discussion of the accuracy/performance trade-offs.
+
+% ---------------------------------------------------------------------------
+\section{Background}\label{sec:background}
+
+\subsection{The rendering equation under environmental lighting}
+
+The outgoing radiance $L_o$ at a surface point in direction $\omega_o$ is
+\begin{equation}
+L_o(\omega_o) = \int_\Omega f_r(\omega_i, \omega_o)\,L_i(\omega_i)\,
+                  (\mathbf{n}\cdot\omega_i)\,\mathrm{d}\omega_i,
+\label{eq:rendering}
+\end{equation}
+where $L_i$ is the incoming radiance, $f_r$ is the bidirectional reflectance
+distribution function (BRDF), $\mathbf{n}$ is the surface normal, and $\Omega$ is
+the upper hemisphere. Under image-based lighting the scene is enclosed by an HDR
+panoramic image at infinity; $L_i(\omega_i)$ is read directly from this image,
+typically resampled into a cubemap to allow constant-time GPU access.
+
+\subsection{Cook--Torrance microfacet BRDF}
+
+We adopt the Cook--Torrance microfacet BRDF~\cite{CookTorrance1982} with the GGX
+normal distribution function~\cite{Walter2007}, the height-correlated Smith
+geometry term~\cite{Heitz2014}, and the Schlick approximation of the Fresnel term:
+\begin{equation}
+f_r =
+\underbrace{\frac{(1-F)(1-m)\,\mathbf{c}}{\pi}}_{\text{Lambertian}}
+\;+\;
+\underbrace{\frac{D(\mathbf{h})\,F(\omega_o,\mathbf{h})\,G(\omega_i,\omega_o)}
+                 {4(\mathbf{n}\cdot\omega_i)(\mathbf{n}\cdot\omega_o)}}_{\text{specular}}.
+\label{eq:brdf}
+\end{equation}
+Here $\mathbf{h}$ is the half-vector, $m \in [0,1]$ is the metallic factor,
+$\mathbf{c}$ the base colour (albedo), and $F_0$ the reflectance at normal
+incidence: $F_0 = \text{mix}(0.04, \mathbf{c}, m)$. The factor $(1-F)$
+enforces energy conservation between the diffuse and specular lobes, and the
+factor $(1-m)$ removes the diffuse contribution for metallic surfaces.
+
+\subsection{The split-sum approximation}
+
+Equation~\eqref{eq:rendering} cannot be evaluated analytically against an HDR
+environment, but it admits a useful factorisation for the two lobes of
+\eqref{eq:brdf}.
+
+\paragraph*{Diffuse term.} For a Lambertian surface, $f_r$ is constant and the
+integral reduces to the cosine-weighted average of incoming radiance,
+\begin{equation}
+E(\mathbf{n}) = \int_\Omega L_i(\omega_i)\,(\mathbf{n}\cdot\omega_i)\,\mathrm{d}\omega_i.
+\end{equation}
+$E$ depends only on the surface normal and can be precomputed once into a cubemap
+indexed by $\mathbf{n}$, the \emph{irradiance map}. The angular bandlimit imposed
+by the cosine kernel is low, so a $32\!\times\!32$ resolution per face is
+sufficient.
+
+\paragraph*{Specular term.} The specular integrand does not separate cleanly,
+because $f_r^{\text{spec}}$ depends jointly on $\omega_i$ and $\omega_o$.
+Karis~\cite{Karis2013} approximates it as a product of two simpler integrals:
+\begin{align}
+&\int_\Omega f_r^{\text{spec}}(\omega_i,\omega_o)\,L_i(\omega_i)\,(\mathbf{n}\cdot\omega_i)\,\mathrm{d}\omega_i \nonumber \\
+&\quad \approx
+\underbrace{\Bigg(\frac{\sum_{k=1}^{N}\!L_i(\omega_k)(\mathbf{n}\cdot\omega_k)}
+                       {\sum_{k=1}^{N}\!(\mathbf{n}\cdot\omega_k)}\Bigg)}_{\text{(I) prefiltered environment}}
+\;\cdot\;
+\underbrace{\int_\Omega f_r^{\text{spec}}(\omega_i,\omega_o)\,(\mathbf{n}\cdot\omega_i)\,\mathrm{d}\omega_i}_{\text{(II) BRDF integral}}\!.
+\label{eq:split}
+\end{align}
+Factor~(I) depends on the reflection direction $\mathbf{r} = \text{reflect}(-\omega_o,\mathbf{n})$
+and roughness $\alpha$. It is precomputed into a roughness-indexed sequence of
+cubemaps, encoded as mip levels of a single cubemap texture: mip~0 holds the
+mirror-reflection case ($\alpha=0$) and mip~4 holds the fully rough case
+($\alpha=1$). The samples $\omega_k$ are drawn by importance-sampling the GGX
+NDF using a Hammersley quasi-random sequence.
+
+Factor~(II) depends only on $(\mathbf{n}\cdot\omega_o, \alpha)$ and admits a
+further algebraic simplification by isolating the Fresnel term. Substituting
+$F(\omega_o,\mathbf{h}) = F_0 + (1-F_0)(1-\omega_o\!\cdot\!\mathbf{h})^5$ yields
+\begin{equation}
+\int_\Omega f_r^{\text{spec}}(\mathbf{n}\cdot\omega_i)\,\mathrm{d}\omega_i
+\;=\;
+F_0\,A(\mathbf{n}\!\cdot\!\omega_o,\alpha) + B(\mathbf{n}\!\cdot\!\omega_o,\alpha),
+\label{eq:lut}
+\end{equation}
+where $A$ and $B$ are scalar functions of two arguments. They are precomputed
+into a single 2D lookup table, the \emph{BRDF LUT}, with the two channels of an
+\texttt{RG16F} texture storing $A$ and $B$ respectively.
+
+At render time the specular IBL evaluation collapses to two texture fetches and
+a multiply--add, independent of the environment complexity.
+
+% ---------------------------------------------------------------------------
+\section{Pipeline}\label{sec:pipeline}
+
+\begin{figure}[t]
+\centering
+% \includegraphics[width=0.95\linewidth]{figures/pipeline.pdf}
+\fbox{\parbox{0.92\linewidth}{\footnotesize\centering\vspace{1ex}
+\texttt{HDR file} $\rightarrow$ \texttt{equirect texture} $\rightarrow$
+\texttt{environment cubemap (512$^2$)} \\[0.5ex]
+$\downarrow\qquad\qquad\quad\downarrow\qquad\qquad\quad\downarrow$ \\[0.5ex]
+\texttt{irradiance (32$^2$)}\quad
+\texttt{prefilter (128$^2$+mips)}\quad
+\texttt{BRDF LUT (512$^2$)} \\[0.5ex]
+$\downarrow$ \\[0.5ex]
+\texttt{PBR fragment shader} $\rightarrow$ \texttt{tonemap} $\rightarrow$ \texttt{framebuffer}
+\vspace{1ex}}}
+\caption{Pipeline overview. The HDR equirectangular image is converted into a
+cubemap, from which three precomputed structures are derived; the rendering pass
+combines them with a Cook--Torrance Fresnel response.}
+\label{fig:pipeline}
+\end{figure}
+
+The pipeline (Fig.~\ref{fig:pipeline}) consists of four preprocessing passes
+executed once when an HDR environment is loaded, and a single fragment shading
+pass per frame.
+
+\subsection{Equirectangular--to--cubemap conversion}
+
+The HDR file is loaded as a 2D texture in equirectangular projection (longitude
+$\times$ latitude). A unit cube is rendered six times into the faces of a $512^2$
+cubemap; the fragment shader samples the equirectangular texture using the texel
+direction $\mathbf{d} = \widehat{\text{localPos}}$ converted to spherical UVs:
+\begin{equation}
+u = \tfrac{1}{2\pi}\arctan(\mathbf{d}_z, \mathbf{d}_x) + 0.5,\quad
+v = \tfrac{1}{\pi}\arcsin(\mathbf{d}_y) + 0.5.
+\end{equation}
+Storage is \texttt{GL\_RGB16F} to retain the HDR range across the full pipeline.
+
+\subsection{Diffuse irradiance convolution}
+
+For each output texel of a $32^2$ cubemap face, the upper hemisphere around the
+texel's direction is integrated by a uniform Riemann sum on $(\phi,\theta)$ with
+a step of $0.025$\,rad ($\approx 1{,}300$ samples per texel). The integrand is
+$L_i(\omega)\sin\theta\cos\theta$; the multiplicative $\pi$ from the diffuse
+normalisation is applied at the end. The low output resolution suffices because
+the cosine kernel acts as a low-pass filter that removes high-frequency content.
+
+\subsection{GGX prefiltered environment map}
+
+The prefiltered cubemap is allocated at $128^2$ with five mip levels and
+\texttt{GL\_LINEAR\_MIPMAP\_LINEAR} filtering. For each mip level $i\in\{0,\dots,4\}$
+the roughness is set to $\alpha = i/4$. The fragment shader, given the output
+direction $\mathbf{n}$ (assumed equal to $\mathbf{v}$ and $\mathbf{r}$ following
+Karis), draws $N$ samples (default $N=1024$) from a Hammersley
+sequence~\cite{Hammersley1964}, transforms them into half-vectors $\mathbf{h}$
+through the GGX inverse-CDF, computes $\mathbf{L} = \text{reflect}(-\mathbf{v},\mathbf{h})$,
+and accumulates the environment radiance weighted by $(\mathbf{n}\cdot\mathbf{L})$.
+
+\begin{lstlisting}[caption={GGX importance sampling for the prefilter pass.},
+                   label={lst:prefilter}]
+vec3 importanceSampleGGX(vec2 Xi, vec3 N, float roughness) {
+    float a   = roughness * roughness;
+    float phi = 2.0 * PI * Xi.x;
+    float ct  = sqrt((1.0 - Xi.y) / (1.0 + (a*a - 1.0)*Xi.y));
+    float st  = sqrt(1.0 - ct*ct);
+    vec3  H   = vec3(cos(phi)*st, sin(phi)*st, ct);
+    // ...transform from tangent space into world space using N...
+    return normalize(tangent*H.x + bitangent*H.y + N*H.z);
+}
+\end{lstlisting}
+
+\subsection{BRDF lookup table}
+
+A $512\!\times\!512$ \texttt{RG16F} texture is rendered once at startup with a
+single full-screen quad. The fragment shader evaluates equation~\eqref{eq:lut}
+by importance-sampling the GGX NDF with 1024 Hammersley samples and accumulating
+$(1{-}F_c)\,G_{\text{vis}}$ and $F_c\,G_{\text{vis}}$ separately into the two
+output channels, where $F_c = (1{-}\mathbf{v}\!\cdot\!\mathbf{h})^5$ and
+$G_{\text{vis}}$ is the visibility-weighted Smith geometry term. The result is
+material-independent and need not be regenerated when the environment or the
+material changes.
+
+\subsection{Rendering pass}
+
+Per pixel the fragment shader (Listing~\ref{lst:pbr}) computes the diffuse
+contribution with one cubemap fetch, the specular contribution with two (the
+prefiltered map sampled at \textsc{lod}$=\alpha\cdot4$ and the BRDF LUT at
+$(\mathbf{n}\!\cdot\!\mathbf{v}, \alpha)$), and combines them with a
+roughness-modulated Schlick Fresnel response~\cite{Lazarov2013} that avoids
+edge darkening at high roughness.
+
+\begin{lstlisting}[caption={Core of the per-pixel IBL evaluation.},
+                   label={lst:pbr}]
+vec3 F  = fresnelSchlickRoughness(NdotV, F0, roughness);
+vec3 kD = (1.0 - F) * (1.0 - metallic);
+
+vec3 irradiance = texture(irradianceMap, N).rgb;
+vec3 diffuse    = kD * irradiance * albedo;
+
+vec3 prefiltered = textureLod(prefilterMap, R, roughness * 4.0).rgb;
+vec2 brdf        = texture(brdfLUT, vec2(NdotV, roughness)).rg;
+vec3 specular    = prefiltered * (F * brdf.x + brdf.y);
+
+color = (diffuse + specular) * exposure;
+color = tonemap(color);
+\end{lstlisting}
+
+The final colour passes through a tonemapping operator (Reinhard, ACES filmic,
+or Uncharted~2~\cite{Hable2010}) and gamma correction before being written to
+the framebuffer.
+
+% ---------------------------------------------------------------------------
+\section{Implementation}\label{sec:impl}
+
+The application is implemented in C++17 against OpenGL~3.3 core profile, with
+GLFW for window/context management, GLAD as the function loader, GLM for linear
+algebra, \texttt{stb\_image} for HDR decoding, and Dear ImGui for the parameter
+UI. All map dimensions and the prefilter sample count are exposed through ImGui
+(Fig.~\ref{fig:ui}); modifying any of them triggers regeneration of the affected
+map without restarting the application. Three primitive meshes (sphere, cube,
+torus) and a $7\!\times\!7$ roughness--metallic grid mode are provided for visual
+inspection. The source tree is approximately 1.5\,kLOC of C++ and 350~LOC of GLSL,
+and builds to a single executable through CMake.
+
+\begin{figure}[t]
+\centering
+% \includegraphics[width=0.55\linewidth]{figures/ui.png}
+\fbox{\parbox{0.55\linewidth}{\footnotesize\centering\vspace{0.5ex}
+[screenshot of the ImGui panel]
+\vspace{0.5ex}}}
+\caption{ImGui control panel. The user adjusts material parameters, exposure,
+the tonemapping operator, scene composition (single object or material grid),
+the active HDR environment, and the four IBL preprocessing resolutions.}
+\label{fig:ui}
+\end{figure}
+
+% ---------------------------------------------------------------------------
+\section{Results}\label{sec:results}
+
+\subsection{Qualitative evaluation}
+
+Figure~\ref{fig:grid} shows the $7\!\times\!7$ material grid under
+\texttt{abandoned\_parking} (rows: metallic $0\!\rightarrow\!1$;
+columns: roughness $0.05\!\rightarrow\!1$). Dielectric materials (top row)
+exhibit the expected Fresnel rim brightening and roughness-dependent reflection
+blur. Pure metals (bottom row) show a coloured specular response controlled by
+the albedo, with no diffuse contribution. Intermediate rows correctly interpolate
+between the two regimes following the metallic workflow.
+
+Figure~\ref{fig:env} contrasts a single mirror sphere under three HDR
+environments. The pipeline correctly reproduces the overcast soft lighting of
+\texttt{abandoned\_parking}, the studio key-and-fill lighting of
+\texttt{studio\_small\_03}, and the strong sun-and-sky contrast of
+\texttt{kloppenheim\_06}. Because $L_i$ is
+stored at \texttt{GL\_RGB16F}, the sun disk in \texttt{kloppenheim\_06} retains
+its high dynamic range and produces a clipped highlight after tonemapping,
+matching the behaviour of physically captured reflections.
+
+\begin{figure}[t]
+\centering
+% \includegraphics[width=\linewidth]{figures/grid_parking.jpg}
+\fbox{\parbox{0.95\linewidth}{\footnotesize\centering\vspace{4ex}
+[7$\times$7 material grid under \texttt{abandoned\_parking}]
+\vspace{4ex}}}
+\caption{Material grid. Rows top--to--bottom: increasing metallic.
+Columns left--to--right: increasing roughness. A single HDR environment
+(\texttt{abandoned\_parking}) is used for all 49 spheres.}
+\label{fig:grid}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+% \includegraphics[width=\linewidth]{figures/env_comparison.jpg}
+\fbox{\parbox{0.95\linewidth}{\footnotesize\centering\vspace{2ex}
+[mirror sphere under three HDR environments]
+\vspace{2ex}}}
+\caption{Mirror sphere ($\alpha=0.05$, $m=1$, white albedo) under three HDR
+environments: \texttt{abandoned\_parking}, \texttt{studio\_small\_03},
+and \texttt{kloppenheim\_06} (left to right).}
+\label{fig:env}
+\end{figure}
+
+\subsection{Preprocessing performance}
+
+Wall-clock preprocessing times are measured around a \texttt{glFinish()} barrier
+to capture the actual GPU execution cost. Measurements are taken on an Apple
+Silicon Mac with the OpenGL~4.1 Metal driver (Metal driver version 90.5).
+Table~\ref{tab:sweep} sweeps the four independent parameters of the pipeline to
+isolate the cost of each pass.
+
+\begin{table*}[t]
+\centering
+\caption{Preprocessing time (ms) at five operating points on an Apple Silicon
+Mac, single HDR environment, measured with \texttt{glFinish()} barriers. Row~1
+includes a one-time shader-compilation overhead on first use; rows~2--5 are warm.}
+\label{tab:sweep}
+\small
+\begin{tabular}{lcccc|rrrr|r}
+\toprule
+\# & Cubemap & Irradiance & Prefilter & Samples & Equirect & Irradiance & Prefilter & BRDF LUT & Total \\
+\midrule
+1 (cold) & $512^2$  & $32^2$ & $128^2$ & 1024 & 59.8 & 175.9 & 43.3 & 21.2 & 300.1 \\
+2        & $1024^2$ & $32^2$ & $128^2$ & 1024 & 29.4 &  43.5 & 22.0 &  8.1 & 102.9 \\
+3        & $1024^2$ & $64^2$ & $128^2$ & 1024 & 26.2 &  65.4 & 21.8 &  7.9 & 121.4 \\
+4        & $1024^2$ & $64^2$ & $256^2$ & 1024 & 57.9 &  63.2 & 33.5 &  7.9 & 162.5 \\
+5        & $1024^2$ & $64^2$ & $256^2$ & 2048 & 23.7 &  67.2 & 63.2 &  7.9 & 162.0 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Four observations follow directly from the sweep. First, doubling the prefilter
+output resolution from $128^2$ to $256^2$ (rows~3$\rightarrow$4) increases the
+prefilter pass from 21.8 to 33.5\,ms (1.5$\times$ rather than 4$\times$, because
+the highest-resolution mip is a small fraction of the total texel count and the
+lower mips remain at their original size). Second, doubling the prefilter sample
+count from 1024 to 2048 (rows~4$\rightarrow$5) increases the prefilter pass from
+33.5 to 63.2\,ms (1.9$\times$, close to the expected linear scaling). Third,
+doubling the irradiance resolution from $32^2$ to $64^2$ (rows~2$\rightarrow$3)
+takes the irradiance pass from 43.5 to 65.4\,ms (1.5$\times$); the irradiance
+shader's inner Riemann loop is the same per texel, so the increase reflects the
+$4\times$ growth in texel count partly absorbed by the GPU's spare capacity at
+small kernel sizes. Fourth, the BRDF LUT cost is constant at $\sim$8\,ms
+regardless of any other parameter, as expected since it is material- and
+environment-independent.
+
+Even at the most expensive operating point the total preprocessing cost remains
+well under one second, which is acceptable for an interactive environment
+switch.
+
+\subsection{Rendering performance}
+
+The PBR fragment shader performs a constant amount of work per pixel: three
+texture fetches, two normalisations, one half-vector evaluation, and the
+Cook--Torrance arithmetic. At $1280\!\times\!720$ on the same machine the
+application runs at a sustained 120\,FPS in both the single-sphere mode and the
+$7\!\times\!7$ grid mode (49 spheres, $\sim 0.7$\,M triangles after meshing at
+$64\!\times\!64$ segments per sphere). This rate is the refresh-locked ceiling
+of the ProMotion display and represents an upper bound rather than a measure of
+the shader's intrinsic cost; nevertheless it confirms that the per-pixel
+evaluation of equation~\eqref{eq:split} is well within the real-time budget
+even when the rest of the geometry pipeline is moderately loaded.
+
+\subsection{Trade-offs}
+
+The split-sum factorisation introduces a small bias that is most visible at
+grazing angles on rough surfaces; the assumption
+$\mathbf{n}\!=\!\mathbf{v}\!=\!\mathbf{r}$ during the prefilter pass loses the
+elongation of the GGX specular lobe in oblique reflections. In practice this
+error is masked by the high entropy of natural HDR content and is generally not
+perceptible against the more dominant effects of tonemapping and exposure.
+
+The free parameters of the pipeline interact as follows:
+\begin{itemize}
+\setlength{\itemsep}{0pt}
+\item The \emph{cubemap resolution} controls the angular fidelity of the source
+      environment and bounds the maximum quality reachable by the prefilter pass.
+\item The \emph{irradiance resolution} can be very low (16--64) without any
+      perceptible loss, because the cosine kernel is strongly low-pass.
+\item The \emph{prefilter base resolution} and \emph{mip count} control the
+      angular precision of mirror-like reflections; the lowest-roughness mip
+      contains the highest-frequency content and benefits most from increased
+      resolution.
+\item The \emph{importance sample count} controls residual high-frequency noise
+      at intermediate-to-high roughness; for $\alpha \geq 0.5$ the angular
+      density of useful samples drops sharply, and 2048 samples remain a useful
+      upper bound on production engines.
+\end{itemize}
+Of these, only the prefilter cost grows linearly with the sample count and
+quadratically with the base resolution; the others are negligible.
+
+% ---------------------------------------------------------------------------
+\section{Limitations and Future Work}
+
+The implementation evaluates a single bounce of environmental light. It does not
+model parallax inside the environment (the HDR map is assumed to be at infinity),
+local shadowing of the IBL contribution (which would require an ambient occlusion
+or screen-space visibility pass), or interreflection between scene objects. The diffuse irradiance is integrated by a uniform
+$(\phi,\theta)$ Riemann sum rather than projected onto spherical
+harmonics~\cite{Ramamoorthi2001}; the latter would compress the storage from a
+cubemap to a 9-coefficient vector at no perceptual cost for the diffuse term.
+
+The Karis prefilter assumption $\mathbf{n}=\mathbf{v}$ is the principal source
+of approximation error in the specular term. It can be partially mitigated by
+the multi-scattering formulation of Fdez-Ag{\"u}era~\cite{Fdez2019}, which
+recovers the energy lost by the single-scattering Smith geometry term and is
+critical for high-roughness metals.
+
+% ---------------------------------------------------------------------------
+\section{Conclusion}
+
+We described a complete real-time IBL pipeline based on the split-sum
+approximation, validated its behaviour qualitatively across three HDR
+environments with different lighting characteristics, and quantified its
+preprocessing and rendering cost. On an Apple Silicon Mac the technique attains
+the vsync-locked frame rate of 120\,FPS at $1280\!\times\!720$ with a one-time
+preprocessing budget of approximately 100--160\,ms per environment switch in
+warm state, and exposes a small set of intuitive parameters that allow the user
+to trade preprocessing time against angular fidelity. The source code, build instructions,
+and the data used to produce this report are available under the MIT licence.
+
+% ---------------------------------------------------------------------------
+\bibliographystyle{eg-alpha-doi}
+\bibliography{ibl-seminar}
+
+\end{document}

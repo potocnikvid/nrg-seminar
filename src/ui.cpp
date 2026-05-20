@@ -19,6 +19,10 @@ void drawUI(UIState& state, const char** envNames, int envCount) {
 
     ImGui::Begin("IBL Controls");
 
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::Text("Frame: %.2f ms (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
+    ImGui::Separator();
+
     ImGui::ColorEdit3("Albedo", &state.albedo.x);
     ImGui::SliderFloat("Roughness", &state.roughness, 0.0f, 1.0f);
     ImGui::SliderFloat("Metallic",  &state.metallic,  0.0f, 1.0f);

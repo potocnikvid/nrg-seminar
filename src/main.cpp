@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <chrono>
 
 #include "gl_context.h"
 #include "env_map.h"
@@ -81,12 +82,36 @@ static const int sampleCountOptions[]    = { 256, 512, 1024, 2048 };
 static const int lutSizeOptions[]        = { 128, 256, 512 };
 
 static IBLMaps generateIBLMaps(GLuint hdrTex, const UIState& ui) {
+    using clk = std::chrono::high_resolution_clock;
+    auto ms = [](clk::duration d) {
+        return std::chrono::duration<double, std::milli>(d).count();
+    };
+
     IBLMaps m{};
-    m.envCubemap     = equirectToCubemap(hdrTex, cubemapSizeOptions[ui.cubemapSizeIdx]);
-    m.irradianceMap  = generateIrradianceMap(m.envCubemap, irradianceSizeOptions[ui.irradianceSizeIdx]);
-    m.prefilteredMap = generatePrefilteredMap(m.envCubemap,
-                           prefilterSizeOptions[ui.prefilterSizeIdx], 5,
-                           sampleCountOptions[ui.prefilterSamplesIdx]);
+    const int cubeSz = cubemapSizeOptions[ui.cubemapSizeIdx];
+    const int irrSz  = irradianceSizeOptions[ui.irradianceSizeIdx];
+    const int preSz  = prefilterSizeOptions[ui.prefilterSizeIdx];
+    const int preSm  = sampleCountOptions[ui.prefilterSamplesIdx];
+
+    auto t0 = clk::now();
+    m.envCubemap = equirectToCubemap(hdrTex, cubeSz);
+    glFinish();
+    auto t1 = clk::now();
+    m.irradianceMap = generateIrradianceMap(m.envCubemap, irrSz);
+    glFinish();
+    auto t2 = clk::now();
+    m.prefilteredMap = generatePrefilteredMap(m.envCubemap, preSz, 5, preSm);
+    glFinish();
+    auto t3 = clk::now();
+
+    std::cout << "[IBL] equirect->cube  " << cubeSz << "^2          : "
+              << ms(t1 - t0) << " ms\n";
+    std::cout << "[IBL] irradiance      " << irrSz << "^2           : "
+              << ms(t2 - t1) << " ms\n";
+    std::cout << "[IBL] prefilter       " << preSz << "^2 5mip "
+              << preSm << "spp : " << ms(t3 - t2) << " ms\n";
+    std::cout << "[IBL] total preprocessing                : "
+              << ms(t3 - t0) << " ms" << std::endl;
     return m;
 }
 
@@ -140,7 +165,15 @@ int main() {
 
     GLuint hdrTex = loadHDR(hdrFiles[0]);
     IBLMaps ibl = generateIBLMaps(hdrTex, ui);
+
+    auto tLut0 = std::chrono::high_resolution_clock::now();
     GLuint brdfLUT = generateBRDFLUT(lutSizeOptions[ui.lutSizeIdx]);
+    glFinish();
+    auto tLut1 = std::chrono::high_resolution_clock::now();
+    std::cout << "[IBL] BRDF LUT       " << lutSizeOptions[ui.lutSizeIdx]
+              << "^2 1024spp     : "
+              << std::chrono::duration<double, std::milli>(tLut1 - tLut0).count()
+              << " ms" << std::endl;
 
     int prevEnvIndex = 0;
 
@@ -175,7 +208,15 @@ int main() {
             glDeleteTextures(1, &ibl.prefilteredMap);
             glDeleteTextures(1, &brdfLUT);
             ibl = generateIBLMaps(hdrTex, ui);
+            auto rt0 = std::chrono::high_resolution_clock::now();
             brdfLUT = generateBRDFLUT(lutSizeOptions[ui.lutSizeIdx]);
+            glFinish();
+            auto rt1 = std::chrono::high_resolution_clock::now();
+            std::cout << "[IBL] BRDF LUT       "
+                      << lutSizeOptions[ui.lutSizeIdx]
+                      << "^2 1024spp     : "
+                      << std::chrono::duration<double, std::milli>(rt1 - rt0).count()
+                      << " ms" << std::endl;
             glViewport(0, 0, windowW, windowH);
         }
 
