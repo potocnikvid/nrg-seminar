@@ -8,6 +8,8 @@
 #include <vector>
 #include <filesystem>
 #include <chrono>
+#include <cmath>
+#include <algorithm>
 
 #include "gl_context.h"
 #include "env_map.h"
@@ -186,10 +188,48 @@ int main() {
 
     glViewport(0, 0, windowW, windowH);
 
+    struct BenchConfig { const char* name; bool grid; bool spec; };
+    const BenchConfig benchConfigs[] = {
+        {"single, diff+spec", false, true },
+        {"single, diff only", false, false},
+        {"grid,   diff+spec", true,  true },
+        {"grid,   diff only", true,  false},
+    };
+    const int benchWarmup = 120, benchMeasure = 3000;
+    bool benchActive = false;
+    int  benchCfg = 0, benchFrame = 0;
+    std::vector<double> benchTimes(benchMeasure, 0.0);
+    bool benchSavedGrid = false, benchSavedSpec = true;
+    std::chrono::high_resolution_clock::time_point benchFrameStart;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             glfwSetWindowShouldClose(window, true);
+
+        if (ui.vsyncChanged) {
+            ui.vsyncChanged = false;
+            glfwSwapInterval(ui.vsync ? 1 : 0);
+        }
+
+        if (ui.benchmarkRequest && !benchActive) {
+            ui.benchmarkRequest = false;
+            benchActive   = true;
+            benchCfg      = 0;
+            benchFrame    = 0;
+            benchSavedGrid = ui.gridMode;
+            benchSavedSpec = ui.showSpecular;
+            glfwSwapInterval(0);
+            std::cout << "\n[bench] starting benchmark (vsync off, "
+                      << benchWarmup << " warmup + " << benchMeasure
+                      << " measured frames per config)\n";
+        }
+
+        if (benchActive) {
+            ui.gridMode     = benchConfigs[benchCfg].grid;
+            ui.showSpecular = benchConfigs[benchCfg].spec;
+            benchFrameStart = std::chrono::high_resolution_clock::now();
+        }
 
         if (ui.envIndex != prevEnvIndex) {
             glDeleteTextures(1, &hdrTex);
@@ -199,6 +239,7 @@ int main() {
             hdrTex = loadHDR(hdrFiles[ui.envIndex]);
             ibl = generateIBLMaps(hdrTex, ui);
             prevEnvIndex = ui.envIndex;
+            glViewport(0, 0, windowW, windowH);
         }
 
         if (ui.regenerateIBL) {
@@ -302,6 +343,39 @@ int main() {
         drawUI(ui, envNames.data(), static_cast<int>(envNames.size()));
 
         glfwSwapBuffers(window);
+
+        if (benchActive) {
+            glFinish();
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - benchFrameStart).count();
+            if (benchFrame >= benchWarmup) {
+                benchTimes[benchFrame - benchWarmup] = ms;
+            }
+            benchFrame++;
+
+            if (benchFrame >= benchWarmup + benchMeasure) {
+                std::vector<double> sorted = benchTimes;
+                std::sort(sorted.begin(), sorted.end());
+                double median = sorted[benchMeasure / 2];
+                double p1     = sorted[(int)(benchMeasure * 0.01)];
+                double p99    = sorted[(int)(benchMeasure * 0.99)];
+                double sum = 0;
+                for (double t : benchTimes) sum += t;
+                double mean = sum / benchMeasure;
+                std::printf("[bench] %-20s  median=%6.3f ms  (p1=%5.3f  p99=%6.3f  mean=%6.3f)  -> %5.0f FPS\n",
+                            benchConfigs[benchCfg].name, median, p1, p99, mean, 1000.0 / median);
+                std::fflush(stdout);
+                benchFrame = 0;
+                benchCfg++;
+                if (benchCfg >= (int)(sizeof(benchConfigs) / sizeof(benchConfigs[0]))) {
+                    benchActive    = false;
+                    ui.gridMode    = benchSavedGrid;
+                    ui.showSpecular = benchSavedSpec;
+                    glfwSwapInterval(ui.vsync ? 1 : 0);
+                    std::cout << "[bench] done\n" << std::endl;
+                }
+            }
+        }
     }
 
     shutdownUI();

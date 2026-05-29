@@ -22,6 +22,9 @@ struct UIState {
     int       prefilterSamplesIdx = 2;
     int       lutSizeIdx        = 2;
     bool      regenerateIBL     = false;
+    bool      vsync             = false;
+    bool      vsyncChanged      = true;
+    bool      benchmarkRequest  = false;
 };
 
 void initUI(GLFWwindow* window);

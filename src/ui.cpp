@@ -17,10 +17,21 @@ void drawUI(UIState& state, const char** envNames, int envCount) {
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
+    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(360, 480), ImGuiCond_FirstUseEver);
     ImGui::Begin("IBL Controls");
 
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::Text("Frame: %.2f ms (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
+    static float fpsDisplayed = 0.0f, msDisplayed = 0.0f, accumTime = 0.0f;
+    accumTime += io.DeltaTime;
+    if (accumTime >= 0.5f) {
+        fpsDisplayed = io.Framerate;
+        msDisplayed  = 1000.0f / io.Framerate;
+        accumTime    = 0.0f;
+    }
+    ImGui::Text("Frame: %.2f ms (%.0f FPS)", msDisplayed, fpsDisplayed);
+    if (ImGui::Checkbox("VSync", &state.vsync)) state.vsyncChanged = true;
+    if (ImGui::Button("Run Benchmark")) state.benchmarkRequest = true;
     ImGui::Separator();
 
     ImGui::ColorEdit3("Albedo", &state.albedo.x);
