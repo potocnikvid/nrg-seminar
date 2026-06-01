@@ -5,26 +5,40 @@
 #include "gl_context.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <chrono>
 #include <iostream>
 
 GLuint loadHDR(const std::string& path) {
+    using clk = std::chrono::high_resolution_clock;
+    auto ms = [](clk::duration d) {
+        return std::chrono::duration<double, std::milli>(d).count();
+    };
     stbi_set_flip_vertically_on_load(true);
     int w, h, nrComponents;
+    auto tDec0 = clk::now();
     float* data = stbi_loadf(path.c_str(), &w, &h, &nrComponents, 0);
+    auto tDec1 = clk::now();
     if (!data) {
         std::cerr << "Failed to load HDR: " << path << "\n";
         return 0;
     }
-    std::cout << "Loaded HDR: " << w << "x" << h << " (" << nrComponents << " channels)" << std::endl;
+    std::cout << "Loaded HDR: " << w << "x" << h
+              << " (" << nrComponents << " channels)  "
+              << "decode " << ms(tDec1 - tDec0) << " ms" << std::endl;
 
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
+    auto tUp0 = clk::now();
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, w, h, 0, GL_RGB, GL_FLOAT, data);
+    glFinish();
+    auto tUp1 = clk::now();
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    std::cout << "[HDR] GPU upload    " << w << "x" << h
+              << "          : " << ms(tUp1 - tUp0) << " ms" << std::endl;
 
     stbi_image_free(data);
     return tex;

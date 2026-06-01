@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 
 #include "gl_context.h"
 #include "env_map.h"
@@ -18,6 +19,9 @@
 #include "brdf_lut.h"
 #include "pbr_renderer.h"
 #include "ui.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 namespace {
     Camera camera;
@@ -117,7 +121,19 @@ static IBLMaps generateIBLMaps(GLuint hdrTex, const UIState& ui) {
     return m;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    std::string screenshotDir;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--screenshots" && i + 1 < argc) {
+            screenshotDir = argv[++i];
+        }
+    }
+    const bool screenshotMode = !screenshotDir.empty();
+    if (screenshotMode) {
+        std::filesystem::create_directories(screenshotDir);
+    }
+
     if (!glfwInit()) { std::cerr << "GLFW init failed\n"; return 1; }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -187,6 +203,185 @@ int main() {
     GLuint skyboxShader = loadShader("shaders/skybox.vert", "shaders/skybox.frag");
 
     glViewport(0, 0, windowW, windowH);
+
+    if (screenshotMode) {
+        struct Shot {
+            const char* file;
+            int    envIndexHint;
+            const char* envSubstring;
+            bool   grid;
+            float  roughness;
+            float  metallic;
+            glm::vec3 albedo;
+            float  camYaw, camPitch, camDistance;
+            bool   showBackground;
+            bool   withUI;
+        };
+        const Shot shots[] = {
+            { "grid_abandoned.png",        0, "abandoned",            true,  0.0f, 0.0f, glm::vec3(0.5f,0.0f,0.0f), 0.0f, 0.0f, 22.0f, true,  false },
+            { "mirror_abandoned.png",      0, "abandoned",            false, 0.05f, 1.0f, glm::vec3(1.0f,1.0f,1.0f), 0.0f, 0.0f, 3.5f,  true,  false },
+            { "mirror_studio.png",         0, "studio_small",         false, 0.05f, 1.0f, glm::vec3(1.0f,1.0f,1.0f), 0.0f, 0.0f, 3.5f,  true,  false },
+            { "mirror_kloppenheim.png",    0, "kloppenheim",          false, 0.05f, 1.0f, glm::vec3(1.0f,1.0f,1.0f), 0.0f, 0.0f, 3.5f,  true,  false },
+            { "rough_gold.png",            0, "kloppenheim",          false, 0.4f, 1.0f, glm::vec3(1.0f,0.78f,0.34f),0.0f, 0.0f, 3.5f,  true,  false },
+            { "ui_panel.png",              0, "abandoned",            false, 0.35f, 0.8f, glm::vec3(0.85f,0.65f,0.30f),0.0f, 0.0f, 4.0f, true, true  },
+            { "mirror_dikhololo_1k.png",   0, "dikhololo_night_1k",   false, 0.05f, 1.0f, glm::vec3(1.0f,1.0f,1.0f), 0.0f, 0.0f, 3.5f,  true,  false },
+            { "mirror_dikhololo_4k.png",   0, "dikhololo_night_4k",   false, 0.05f, 1.0f, glm::vec3(1.0f,1.0f,1.0f), 0.0f, 0.0f, 3.5f,  true,  false },
+            { "mirror_ferndale.png",       0, "ferndale_studio",      false, 0.05f, 1.0f, glm::vec3(1.0f,1.0f,1.0f), 0.0f, 0.0f, 3.5f,  true,  false },
+            { "mirror_glasshouse_1k.png",  0, "glasshouse_interior_1k",false,0.05f, 1.0f, glm::vec3(1.0f,1.0f,1.0f), 0.0f, 0.0f, 3.5f,  true,  false },
+            { "mirror_glasshouse_4k.png",  0, "glasshouse_interior_4k",false,0.05f, 1.0f, glm::vec3(1.0f,1.0f,1.0f), 0.0f, 0.0f, 3.5f,  true,  false },
+            { "grid_glasshouse_4k.png",    0, "glasshouse_interior_4k",true, 0.0f,  0.0f, glm::vec3(0.5f,0.0f,0.0f), 0.0f, 0.0f, 22.0f, true,  false },
+        };
+
+        std::vector<unsigned char> px(windowW * windowH * 3);
+        std::vector<unsigned char> flipped(windowW * windowH * 3);
+
+        for (const Shot& s : shots) {
+            int matchIdx = -1;
+            for (size_t i = 0; i < envNameStrings.size(); ++i) {
+                if (envNameStrings[i].find(s.envSubstring) != std::string::npos) {
+                    matchIdx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (matchIdx < 0) {
+                std::cerr << "[shot] no env matching '" << s.envSubstring
+                          << "', skipping " << s.file << "\n";
+                continue;
+            }
+            if (matchIdx != prevEnvIndex) {
+                glDeleteTextures(1, &hdrTex);
+                glDeleteTextures(1, &ibl.envCubemap);
+                glDeleteTextures(1, &ibl.irradianceMap);
+                glDeleteTextures(1, &ibl.prefilteredMap);
+                hdrTex = loadHDR(hdrFiles[matchIdx]);
+                ibl = generateIBLMaps(hdrTex, ui);
+                prevEnvIndex = matchIdx;
+                glViewport(0, 0, windowW, windowH);
+            }
+
+            camera.yaw = s.camYaw;
+            camera.pitch = s.camPitch;
+            camera.distance = s.camDistance;
+            ui.gridMode = s.grid;
+            ui.roughness = s.roughness;
+            ui.metallic  = s.metallic;
+            ui.albedo    = s.albedo;
+            ui.showBackground = s.showBackground;
+
+            // For UI shots, run a few throwaway frames so ImGui can
+            // lay out windows and apply FirstUseEver size/pos.
+            const int warmup = s.withUI ? 4 : 0;
+            for (int wf = 0; wf < warmup; ++wf) {
+                glfwPollEvents();
+                glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                drawUI(ui, envNames.data(), static_cast<int>(envNames.size()));
+                glfwSwapBuffers(window);
+            }
+
+            glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            glm::mat4 view = camera.getViewMatrix();
+            glm::mat4 proj = camera.getProjectionMatrix(
+                static_cast<float>(windowW) / static_cast<float>(windowH));
+
+            glUseProgram(pbrShader);
+            glUniformMatrix4fv(glGetUniformLocation(pbrShader, "view"), 1, GL_FALSE, &view[0][0]);
+            glUniformMatrix4fv(glGetUniformLocation(pbrShader, "projection"), 1, GL_FALSE, &proj[0][0]);
+            glm::vec3 camPos = camera.getPosition();
+            glUniform3fv(glGetUniformLocation(pbrShader, "camPos"), 1, &camPos[0]);
+            glUniform1f(glGetUniformLocation(pbrShader, "exposure"), ui.exposure);
+            glUniform1i(glGetUniformLocation(pbrShader, "showDiffuse"),  1);
+            glUniform1i(glGetUniformLocation(pbrShader, "showSpecular"), 1);
+            glUniform1i(glGetUniformLocation(pbrShader, "tonemapMode"), ui.tonemapMode);
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, ibl.irradianceMap);
+            glUniform1i(glGetUniformLocation(pbrShader, "irradianceMap"), 0);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, ibl.prefilteredMap);
+            glUniform1i(glGetUniformLocation(pbrShader, "prefilterMap"), 1);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, brdfLUT);
+            glUniform1i(glGetUniformLocation(pbrShader, "brdfLUT"), 2);
+
+            const Mesh& activeMesh = meshes[0];
+
+            if (s.grid) {
+                int nRows = 7, nCols = 7;
+                float spacing = 2.5f;
+                for (int row = 0; row < nRows; ++row) {
+                    float metallic = static_cast<float>(row) / static_cast<float>(nRows - 1);
+                    for (int col = 0; col < nCols; ++col) {
+                        float roughness = glm::clamp(
+                            static_cast<float>(col) / static_cast<float>(nCols - 1), 0.05f, 1.0f);
+                        glm::mat4 model = glm::mat4(1.0f);
+                        model = glm::translate(model, glm::vec3(
+                            (col - nCols / 2) * spacing,
+                            (row - nRows / 2) * spacing,
+                            0.0f));
+                        glUniformMatrix4fv(glGetUniformLocation(pbrShader, "model"),
+                                           1, GL_FALSE, &model[0][0]);
+                        glUniform3fv(glGetUniformLocation(pbrShader, "albedo"), 1, &ui.albedo[0]);
+                        glUniform1f(glGetUniformLocation(pbrShader, "metallic"), metallic);
+                        glUniform1f(glGetUniformLocation(pbrShader, "roughness"), roughness);
+                        glBindVertexArray(activeMesh.vao);
+                        glDrawElements(GL_TRIANGLES, activeMesh.indexCount, GL_UNSIGNED_INT, nullptr);
+                    }
+                }
+            } else {
+                glm::mat4 model = glm::mat4(1.0f);
+                glUniformMatrix4fv(glGetUniformLocation(pbrShader, "model"),
+                                   1, GL_FALSE, &model[0][0]);
+                glUniform3fv(glGetUniformLocation(pbrShader, "albedo"), 1, &ui.albedo[0]);
+                glUniform1f(glGetUniformLocation(pbrShader, "metallic"), ui.metallic);
+                glUniform1f(glGetUniformLocation(pbrShader, "roughness"),
+                            glm::clamp(ui.roughness, 0.05f, 1.0f));
+                glBindVertexArray(activeMesh.vao);
+                glDrawElements(GL_TRIANGLES, activeMesh.indexCount, GL_UNSIGNED_INT, nullptr);
+            }
+
+            if (s.showBackground) {
+                glUseProgram(skyboxShader);
+                glUniformMatrix4fv(glGetUniformLocation(skyboxShader, "view"),
+                                   1, GL_FALSE, &view[0][0]);
+                glUniformMatrix4fv(glGetUniformLocation(skyboxShader, "projection"),
+                                   1, GL_FALSE, &proj[0][0]);
+                glUniform1f(glGetUniformLocation(skyboxShader, "exposure"), ui.exposure);
+                glUniform1i(glGetUniformLocation(skyboxShader, "tonemapMode"), ui.tonemapMode);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, ibl.envCubemap);
+                glUniform1i(glGetUniformLocation(skyboxShader, "environmentMap"), 0);
+                renderCube();
+            }
+
+            if (s.withUI) {
+                glfwPollEvents();
+                drawUI(ui, envNames.data(), static_cast<int>(envNames.size()));
+            }
+
+            glFinish();
+
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, windowW, windowH, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+            for (int y = 0; y < windowH; ++y) {
+                std::memcpy(&flipped[(windowH - 1 - y) * windowW * 3],
+                            &px[y * windowW * 3],
+                            windowW * 3);
+            }
+            std::string outPath = screenshotDir + "/" + s.file;
+            if (!stbi_write_png(outPath.c_str(), windowW, windowH, 3, flipped.data(), windowW * 3)) {
+                std::cerr << "[shot] failed to write " << outPath << "\n";
+            } else {
+                std::cout << "[shot] wrote " << outPath << "\n";
+            }
+        }
+
+        shutdownUI();
+        glfwTerminate();
+        return 0;
+    }
 
     struct BenchConfig { const char* name; bool grid; bool spec; };
     const BenchConfig benchConfigs[] = {

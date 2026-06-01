@@ -58,7 +58,9 @@ diffuse irradiance map, a roughness-indexed specular map, and a 2D lookup
 table) and combines them at render time with three texture fetches per pixel.
 The implementation runs at thousands of frames per second on an Apple Silicon
 laptop (the per-pixel IBL math is below the measurement floor) and lets the
-user switch HDR environments in 100--160\,ms.}
+user switch HDR environments in roughly 110\,ms from a $1024\!\times\!512$
+source or 275\,ms from a $4096\!\times\!2048$ source. Per-frame cost is
+independent of source resolution.}
 
 \begin{CCSXML}
 <ccs2012>
@@ -281,17 +283,6 @@ quality without restarting the application. The scene offers three
 primitive meshes (sphere, cube, torus) and a $7\!\times\!7$ material-grid
 mode that displays a full sweep of roughness and metallic values at once.
 
-\begin{figure}[t]
-\centering
-\fbox{\parbox{0.55\linewidth}{\footnotesize\centering\vspace{0.5ex}
-[screenshot of the ImGui panel]
-\vspace{0.5ex}}}
-\caption{ImGui control panel. The user adjusts material parameters,
-exposure, the tonemapping operator, scene composition, the active HDR
-environment, and the four IBL preprocessing resolutions.}
-\label{fig:ui}
-\end{figure}
-
 % ---------------------------------------------------------------------------
 \section{Results}\label{sec:results}
 
@@ -316,9 +307,7 @@ photographed reflection would.
 
 \begin{figure}[t]
 \centering
-\fbox{\parbox{0.95\linewidth}{\footnotesize\centering\vspace{4ex}
-[7$\times$7 material grid under \texttt{abandoned\_parking}]
-\vspace{4ex}}}
+\includegraphics[width=0.98\linewidth]{figures/grid_abandoned.png}
 \caption{Material grid. Rows top--to--bottom: increasing metallic.
 Columns left--to--right: increasing roughness. A single HDR environment
 (\texttt{abandoned\_parking}) is used for all 49 spheres.}
@@ -327,9 +316,9 @@ Columns left--to--right: increasing roughness. A single HDR environment
 
 \begin{figure}[t]
 \centering
-\fbox{\parbox{0.95\linewidth}{\footnotesize\centering\vspace{2ex}
-[mirror sphere under three HDR environments]
-\vspace{2ex}}}
+\includegraphics[width=0.32\linewidth]{figures/mirror_abandoned.png}\hfill
+\includegraphics[width=0.32\linewidth]{figures/mirror_studio.png}\hfill
+\includegraphics[width=0.32\linewidth]{figures/mirror_kloppenheim.png}
 \caption{Mirror sphere ($\alpha=0.05$, $m=1$, white albedo) under three HDR
 environments: \texttt{abandoned\_parking}, \texttt{studio\_small\_03},
 and \texttt{kloppenheim\_06} (left to right).}
@@ -373,9 +362,11 @@ each output texel does the same fixed-cost Riemann integration. The BRDF
 LUT is constant at around 8\,ms regardless of any other parameter because
 it does not depend on the environment.
 
-Even at the most expensive operating point the total preprocessing cost is
-under 200\,ms, which is fast enough that switching the HDR environment
-from the UI feels instant.
+Even at the most expensive operating point the total GPU preprocessing cost is
+under 200\,ms. The overall environment-switch latency observed by the user
+also includes the cost of decoding and uploading the HDR file itself, which
+scales with the source image resolution and is discussed in
+Section~\ref{sec:sourceres}.
 
 \subsection{Rendering cost}
 
@@ -420,6 +411,47 @@ scene. In both cases the application sustains thousands of frames per
 second --- between roughly 2300\,FPS for the grid and 4500\,FPS for the
 single sphere --- confirming that equation~\eqref{eq:split} delivers
 real-time performance with significant headroom.
+
+\subsection{HDR source resolution}\label{sec:sourceres}
+
+Poly Haven ships every HDRI at multiple resolutions; we tested the $1\text{k}$
+($1024\!\times\!512$) and $4\text{k}$ ($4096\!\times\!2048$) tiers on the same
+asset (\texttt{dikhololo\_night} and \texttt{glasshouse\_interior}).
+Table~\ref{tab:sourceres} reports the per-stage cost of one environment switch
+averaged over the two pairs.
+
+\begin{table}[t]
+\centering
+\caption{Per-stage environment-switch cost (ms) for $1\text{k}$ and $4\text{k}$
+HDR sources, averaged over two test environments. Decode is CPU
+(\texttt{stb\_image}); upload is the \texttt{glTexImage2D} call into a 16-bit
+float texture; the remaining three stages are GPU work measured around
+\texttt{glFinish()} barriers.}
+\label{tab:sourceres}
+\small
+\begin{tabular}{lrr}
+\toprule
+Stage              & $1\text{k}$ source & $4\text{k}$ source \\
+\midrule
+\texttt{stbi\_loadf} decode    &  \phantom{0}11 &  153 \\
+\texttt{glTexImage2D} upload   &  \phantom{00}2 & \phantom{0}28 \\
+equirect $\rightarrow$ cubemap &  \phantom{0}20 & \phantom{0}17 \\
+irradiance + prefilter         &  \phantom{0}75 & \phantom{0}75 \\
+\midrule
+\textbf{total switch}          & \textbf{108} & \textbf{273} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Only the first two stages scale with source resolution; all downstream work
+operates on the fixed-size cubemap and the source equirect texture is
+discarded immediately afterwards. The shader therefore samples nothing whose
+size depends on the source HDR, and the per-frame render cost reported in
+Table~\ref{tab:render} is identical whether the environment was loaded from a
+$1\text{k}$ or a $4\text{k}$ file. The choice of source resolution is purely a
+trade between switch latency and the sharpness of the perfect-mirror
+reflection at \texttt{mip~0} of the prefiltered cubemap, where any
+undersampling of the source becomes visible.
 
 \subsection{Trade-offs}
 
@@ -466,7 +498,9 @@ implemented it in OpenGL, and measured its behaviour on commodity laptop
 hardware. The renderer sustains thousands of frames per second at
 $1280\!\times\!720$ in both the single-sphere and 49-sphere grid scenes,
 with the per-pixel IBL evaluation itself being too cheap to measure, and
-switches HDR environments in well under 200\,ms. The pipeline exposes four intuitive
+switches HDR environments in roughly 110\,ms from a $1\text{k}$ source and
+275\,ms from a $4\text{k}$ source, with per-frame cost unaffected by source
+resolution (Sec.~\ref{sec:sourceres}). The pipeline exposes four intuitive
 parameters that the user can adjust live; only one of them (the prefilter
 sample count) is expensive enough to be worth tuning carefully. The source
 code, build instructions, and the data used to produce this report are

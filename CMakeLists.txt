@@ -56,6 +56,13 @@ if(NOT EXISTS "${STB_DIR}/stb_image.h")
     "${STB_DIR}/stb_image.h"
   )
 endif()
+if(NOT EXISTS "${STB_DIR}/stb_image_write.h")
+  message(STATUS "Downloading stb_image_write.h ...")
+  file(DOWNLOAD
+    "https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h"
+    "${STB_DIR}/stb_image_write.h"
+  )
+endif()
 
 add_executable(nrg_seminar
   src/main.cpp
